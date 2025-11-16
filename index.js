@@ -6,28 +6,26 @@ const { Client } = require('@notionhq/client');
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
-// === RETRY HELPER ===
-async function withRetry(fn, maxRetries = 5) {
+// === RETRY + LOG EVERYTHING ===
+async function withRetry(fn, id, maxRetries = 5) {
   for (let i = 0; i < maxRetries; i++) {
     try {
       return await fn();
     } catch (err) {
-      if (err.message.includes('ECONNRESET') || err.code === 'ECONNRESET') {
-        console.log(`Connection reset. Retry ${i + 1}/${maxRetries}...`);
-        await delay(1000 * (i + 1));
-      } else {
-        throw err;
-      }
+      console.log(`RETRY ${i + 1}/${maxRetries} for ID ${id}: ${err.message}`);
+      await delay(1000 * (i + 1));
     }
   }
-  throw new Error('Max retries exceeded');
+  console.log(`FAILED PERMANENTLY: ID ${id}`);
+  return null;
 }
 
 async function sync() {
   console.log(`\nSYNC STARTED → ${new Date().toLocaleString('en-GB', { timeZone: 'Asia/Jakarta' })}`);
 
   try {
-    const csvUrl = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQqCHazojRJAxhCRZSYti-xH1IZEcQp0syyWdxqo8OkGsPNlliPNP8LvmP4cBGwOwgLG7miuCE9fEuC/pub?output=csv';
+    // === 1. FETCH FRESH CSV (FORCE NO CACHE) ===
+    const csvUrl = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQqCHazojRJAxhCRZSYti-xH1IZEcQp0syyWdxqo8OkGsPNlliPNP8LvmP4cBGwOwgLG7miuCE9fEuC/pub?output=csv&nocache=' + Date.now();
     const res = await fetch(csvUrl);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const csv = await res.text();
@@ -65,63 +63,66 @@ async function sync() {
         }
       }
 
-      rows.push([fullName, phone, memberId]);
+      rows.push({ name: fullName, phone, id: memberId });
     }
 
-    console.log(`Found ${rows.length} members (with phone: ${rows.filter(r => r[1]).length})`);
+    console.log(`CSV LOADED → ${rows.length} members (with phone: ${rows.filter(r => r.phone).length})`);
 
-    // === GET EXISTING PAGES (with retry + delay) ===
+    // === 2. GET ALL NOTION PAGES ===
     let existing = [];
     let cursor = undefined;
     do {
-      await withRetry(async () => {
-        const res = await notion.databases.query({
-          database_id: process.env.NOTION_DB,
-          start_cursor: cursor,
-          page_size: 100
-        });
+      const res = await withRetry(() => notion.databases.query({
+        database_id: process.env.NOTION_DB,
+        start_cursor: cursor,
+        page_size: 100
+      }), 'DB_QUERY');
+      if (res) {
         existing = existing.concat(res.results);
         cursor = res.next_cursor;
-      });
+      }
       await delay(400);
     } while (cursor);
 
-    const idToPageId = new Map();
+    const idToPage = new Map();
     for (const page of existing) {
       const id = page.properties["Member ID"]?.title?.[0]?.text?.content;
-      if (id) idToPageId.set(id, page.id);
+      if (id) idToPage.set(id, page.id);
     }
+    console.log(`NOTION CURRENT → ${existing.length} pages`);
 
-    // === UPDATE/CREATE WITH RETRY + DELAY ===
-    let updated = 0, created = 0;
-    for (const [name, phone, id] of rows) {
-      const pageId = idToPageId.get(id);
+    // === 3. SYNC WITH LOGS + RETRY ===
+    let updated = 0, created = 0, failed = 0;
+    for (const row of rows) {
+      const result = await withRetry(async () => {
+        const props = {
+          "First Name": { rich_text: [{ text: { content: row.name } }] },
+          "Mobile Phone": row.phone ? { phone_number: row.phone } : { phone_number: null },
+          "Member ID": { title: [{ text: { content: row.id } }] }
+        };
 
-      const props = {
-        "First Name": { rich_text: [{ text: { content: name } }] },
-        "Mobile Phone": phone ? { phone_number: phone } : { phone_number: null },
-        "Member ID": { title: [{ text: { content: id } }] }
-      };
-
-      await withRetry(async () => {
-        if (pageId) {
-          await notion.pages.update({ page_id: pageId, properties: props });
-          updated++;
+        if (idToPage.has(row.id)) {
+          await notion.pages.update({ page_id: idToPage.get(row.id), properties: props });
+          return 'updated';
         } else {
           await notion.pages.create({ parent: { database_id: process.env.NOTION_DB }, properties: props });
-          created++;
+          return 'created';
         }
-      });
+      }, row.id);
 
-      await delay(400); // ~2.5 req/sec = 100% safe
+      if (result === 'updated') updated++;
+      else if (result === 'created') created++;
+      else failed++;
+
+      await delay(400); // ~2.5 req/sec
     }
 
-    console.log(`NOTION DONE → Updated: ${updated} | Created: ${created}`);
+    console.log(`SYNC DONE → Updated: ${updated} | Created: ${created} | Failed: ${failed}`);
 
-    // === SEND .VCF ===
-    const withPhone = rows.filter(r => r[1]);
+    // === 4. SEND .VCF ===
+    const withPhone = rows.filter(r => r.phone);
     if (withPhone.length > 0) {
-      const vcf = withPhone.map(([n, p]) => `BEGIN:VCARD\nVERSION:3.0\nFN:${n}\nTEL:${p}\nEND:VCARD`).join('\n');
+      const vcf = withPhone.map(r => `BEGIN:VCARD\nVERSION:3.0\nFN:${r.name}\nTEL:${r.phone}\nEND:VCARD`).join('\n');
 
       await fetch('https://api.mailgun.net/v3/sandbox91df0697fa28496c9d47efec7d061a34.mailgun.org/messages', {
         method: 'POST',
@@ -132,15 +133,15 @@ async function sync() {
         body: new URLSearchParams({
           from: 'Wahaha Sync <mailgun@sandbox91df0697fa28496c9d47efec7d061a34.mailgun.org>',
           to: 'wahahaseafoodmarketing@gmail.com',
-          subject: `${withPhone.length} Contacts - Import Now`,
-          text: `Open .vcf on phone → tap → ${withPhone.length} contacts appear.`,
+          subject: `${withPhone.length} Contacts - FRESH SYNC`,
+          text: `Open .vcf → tap → ${withPhone.length} contacts imported.\n\nFRESH DATA FROM SQL EXCEL — JUST NOW.`,
           attachment: JSON.stringify({
             filename: 'wahaha-contacts.vcf',
             data: Buffer.from(vcf).toString('base64')
           })
         })
       });
-      console.log('.vcf emailed');
+      console.log('.vcf EMAILED — FRESH DATA');
     }
 
   } catch (err) {
@@ -152,7 +153,6 @@ function parseCSVLine(line) {
   const result = [];
   let field = '';
   let inQuote = false;
-
   for (let i = 0; i < line.length; i++) {
     const c = line[i], n = line[i + 1];
     if (c === '"' && inQuote && n === '"') { field += '"'; i++; }
@@ -164,6 +164,6 @@ function parseCSVLine(line) {
   return result.map(f => f.trim());
 }
 
-// === RUN ===
+// === RUN NOW + DAILY ===
 sync();
 setInterval(sync, 24 * 60 * 60 * 1000);
