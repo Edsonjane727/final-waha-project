@@ -4,9 +4,24 @@ const fetch = require('node-fetch');
 const { Client } = require('@notionhq/client');
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
-
-// === DELAY HELPER ===
 const delay = ms => new Promise(res => setTimeout(res, ms));
+
+// === RETRY HELPER ===
+async function withRetry(fn, maxRetries = 5) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (err.message.includes('ECONNRESET') || err.code === 'ECONNRESET') {
+        console.log(`Connection reset. Retry ${i + 1}/${maxRetries}...`);
+        await delay(1000 * (i + 1));
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw new Error('Max retries exceeded');
+}
 
 async function sync() {
   console.log(`\nSYNC STARTED → ${new Date().toLocaleString('en-GB', { timeZone: 'Asia/Jakarta' })}`);
@@ -18,10 +33,9 @@ async function sync() {
     const csv = await res.text();
 
     const lines = csv.trim().split(/\r?\n/);
-    if (lines.length <= 1) throw new Error('CSV is empty');
+    if (lines.length <= 1) throw new Error('CSV empty');
 
     const rows = [];
-
     for (let i = 1; i < lines.length; i++) {
       const line = lines[i].trim();
       if (!line) continue;
@@ -39,16 +53,14 @@ async function sync() {
 
       let phone = '';
       for (let j = 5; j < cols.length; j++) {
-        let candidate = cols[j]?.trim();
-        if (!candidate) continue;
-        candidate = candidate.replace(/[^0-9+]/g, '');
-        if (/^\+?\d{8,15}$/.test(candidate)) {
-          if (!candidate.startsWith('+')) {
-            if (candidate.startsWith('62')) candidate = '+' + candidate;
-            else if (candidate.startsWith('0')) candidate = '+62' + candidate.slice(1);
-            else candidate = '+62' + candidate;
+        let p = cols[j]?.trim().replace(/[^0-9+]/g, '');
+        if (/^\+?\d{8,15}$/.test(p)) {
+          if (!p.startsWith('+')) {
+            if (p.startsWith('62')) p = '+' + p;
+            else if (p.startsWith('0')) p = '+62' + p.slice(1);
+            else p = '+62' + p;
           }
-          phone = candidate;
+          phone = p;
           break;
         }
       }
@@ -58,63 +70,58 @@ async function sync() {
 
     console.log(`Found ${rows.length} members (with phone: ${rows.filter(r => r[1]).length})`);
 
-    // === GET EXISTING PAGES ===
+    // === GET EXISTING PAGES (with retry + delay) ===
     let existing = [];
     let cursor = undefined;
     do {
-      const response = await notion.databases.query({
-        database_id: process.env.NOTION_DB,
-        start_cursor: cursor,
-        page_size: 100
+      await withRetry(async () => {
+        const res = await notion.databases.query({
+          database_id: process.env.NOTION_DB,
+          start_cursor: cursor,
+          page_size: 100
+        });
+        existing = existing.concat(res.results);
+        cursor = res.next_cursor;
       });
-      existing = existing.concat(response.results);
-      cursor = response.next_cursor;
-      await delay(350); // Respect rate limit
+      await delay(400);
     } while (cursor);
 
     const idToPageId = new Map();
     for (const page of existing) {
-      const titleText = page.properties["Member ID"]?.title?.[0]?.text?.content;
-      if (titleText) idToPageId.set(titleText, page.id);
+      const id = page.properties["Member ID"]?.title?.[0]?.text?.content;
+      if (id) idToPageId.set(id, page.id);
     }
 
-    // === UPDATE/CREATE WITH DELAY ===
+    // === UPDATE/CREATE WITH RETRY + DELAY ===
     let updated = 0, created = 0;
     for (const [name, phone, id] of rows) {
       const pageId = idToPageId.get(id);
 
-      const properties = {
+      const props = {
         "First Name": { rich_text: [{ text: { content: name } }] },
         "Mobile Phone": phone ? { phone_number: phone } : { phone_number: null },
         "Member ID": { title: [{ text: { content: id } }] }
       };
 
-      try {
+      await withRetry(async () => {
         if (pageId) {
-          await notion.pages.update({ page_id: pageId, properties });
+          await notion.pages.update({ page_id: pageId, properties: props });
           updated++;
         } else {
-          await notion.pages.create({
-            parent: { database_id: process.env.NOTION_DB },
-            properties
-          });
+          await notion.pages.create({ parent: { database_id: process.env.NOTION_DB }, properties: props });
           created++;
         }
-        await delay(350); // 3 requests per second = safe
-      } catch (err) {
-        console.log(`Notion error for ID ${id}:`, err.message);
-        await delay(1000); // Wait longer on error
-      }
+      });
+
+      await delay(400); // ~2.5 req/sec = 100% safe
     }
 
     console.log(`NOTION DONE → Updated: ${updated} | Created: ${created}`);
 
     // === SEND .VCF ===
-    const contactsWithPhone = rows.filter(r => r[1]);
-    if (contactsWithPhone.length > 0) {
-      const vcf = contactsWithPhone.map(([name, phone]) =>
-        `BEGIN:VCARD\nVERSION:3.0\nFN:${name}\nTEL:${phone}\nEND:VCARD`
-      ).join('\n');
+    const withPhone = rows.filter(r => r[1]);
+    if (withPhone.length > 0) {
+      const vcf = withPhone.map(([n, p]) => `BEGIN:VCARD\nVERSION:3.0\nFN:${n}\nTEL:${p}\nEND:VCARD`).join('\n');
 
       await fetch('https://api.mailgun.net/v3/sandbox91df0697fa28496c9d47efec7d061a34.mailgun.org/messages', {
         method: 'POST',
@@ -125,20 +132,19 @@ async function sync() {
         body: new URLSearchParams({
           from: 'Wahaha Sync <mailgun@sandbox91df0697fa28496c9d47efec7d061a34.mailgun.org>',
           to: 'wahahaseafoodmarketing@gmail.com',
-          subject: `${contactsWithPhone.length} Contacts - Import Now`,
-          text: `Open .vcf on phone → tap → ${contactsWithPhone.length} contacts appear.`,
+          subject: `${withPhone.length} Contacts - Import Now`,
+          text: `Open .vcf on phone → tap → ${withPhone.length} contacts appear.`,
           attachment: JSON.stringify({
             filename: 'wahaha-contacts.vcf',
             data: Buffer.from(vcf).toString('base64')
           })
         })
       });
-
       console.log('.vcf emailed');
     }
 
-  } catch (error) {
-    console.error('FATAL ERROR:', error.message);
+  } catch (err) {
+    console.error('FATAL ERROR:', err.message);
   }
 }
 
@@ -148,26 +154,16 @@ function parseCSVLine(line) {
   let inQuote = false;
 
   for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    const next = line[i + 1];
-
-    if (char === '"') {
-      if (inQuote && next === '"') {
-        field += '"';
-        i++;
-      } else {
-        inQuote = !inQuote;
-      }
-    } else if (char === ',' && !inQuote) {
-      result.push(field);
-      field = '';
-    } else {
-      field += char;
-    }
+    const c = line[i], n = line[i + 1];
+    if (c === '"' && inQuote && n === '"') { field += '"'; i++; }
+    else if (c === '"') inQuote = !inQuote;
+    else if (c === ',' && !inQuote) { result.push(field); field = ''; }
+    else field += c;
   }
   result.push(field);
   return result.map(f => f.trim());
 }
 
+// === RUN ===
 sync();
 setInterval(sync, 24 * 60 * 60 * 1000);
