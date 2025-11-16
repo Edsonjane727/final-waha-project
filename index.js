@@ -1,4 +1,5 @@
 require('dotenv').config();
+require('./server');
 const fetch = require('node-fetch');
 const { Client } = require('@notionhq/client');
 
