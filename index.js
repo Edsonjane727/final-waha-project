@@ -15,55 +15,76 @@ async function sync() {
     const csv = await res.text();
 
     const lines = csv.trim().split(/\r?\n/);
+    if (lines.length <= 1) throw new Error('CSV is empty');
+
     const rows = [];
 
     for (let i = 1; i < lines.length; i++) {
-      const cols = parseCSVLine(lines[i]);
-      if (cols.length < 5) continue;
+      const line = lines[i].trim();
+      if (!line) continue;
 
-      const id = cols[0]?.trim();
-      const first = cols[3]?.trim();
-      const last = cols[4]?.trim();
-      let phone = cols[13]?.trim() || '';
+      const cols = parseCSVLine(line);
+      if (cols.length < 5) continue; // Need at least ID, First, Last
 
-      if (!id || !first || !last) continue;
+      const memberId = cols[0]?.trim();
+      const firstName = cols[3]?.trim();
+      const lastName = cols[4]?.trim();
 
-      // CLEAN PHONE IF EXISTS
-      if (phone) {
-        phone = phone.replace(/[^0-9+]/g, '');
-        if (!phone.startsWith('+')) {
-          if (phone.startsWith('62')) phone = '+' + phone;
-          else if (phone.startsWith('0')) phone = '+62' + phone.slice(1);
-          else phone = '+62' + phone;
+      if (!memberId || !firstName || !lastName) continue;
+
+      const fullName = `${firstName} ${lastName}`.trim();
+
+      // SEARCH FOR PHONE IN ANY COLUMN AFTER LAST NAME (index 5+)
+      let phone = '';
+      for (let j = 5; j < cols.length; j++) {
+        let candidate = cols[j]?.trim();
+        if (!candidate) continue;
+
+        // Remove all non-digits except +
+        candidate = candidate.replace(/[^0-9+]/g, '');
+
+        // Must be 8–15 digits, optionally starting with +
+        if (/^\+?\d{8,15}$/.test(candidate)) {
+          if (!candidate.startsWith('+')) {
+            if (candidate.startsWith('62')) candidate = '+' + candidate;
+            else if (candidate.startsWith('0')) candidate = '+62' + candidate.slice(1);
+            else candidate = '+62' + candidate;
+          }
+          phone = candidate;
+          break;
         }
       }
 
-      const name = `${first} ${last}`.trim();
-      if (name) {
-        rows.push([name, phone, id]);
-      }
+      rows.push([fullName, phone, memberId]);
     }
 
-    console.log(`Found ${rows.length} members (phones: ${rows.filter(r => r[1]).length})`);
+    console.log(`Found ${rows.length} members (with phone: ${rows.filter(r => r[1]).length})`);
 
-    // NOTION
+    // === NOTION: GET ALL EXISTING PAGES ===
     let existing = [];
-    let cursor;
+    let cursor = undefined;
     do {
-      const r = await notion.databases.query({
+      const response = await notion.databases.query({
         database_id: process.env.NOTION_DB,
-        start_cursor: cursor
+        start_cursor: cursor,
+        page_size: 100
       });
-      existing.push(...r.results);
-      cursor = r.next_cursor;
+      existing = existing.concat(response.results);
+      cursor = response.next_cursor;
     } while (cursor);
 
-    const map = new Map(existing.map(p => [p.properties["Member ID"]?.title?.[0]?.text?.content, p.id]));
+    const idToPageId = new Map();
+    for (const page of existing) {
+      const titleText = page.properties["Member ID"]?.title?.[0]?.text?.content;
+      if (titleText) idToPageId.set(titleText, page.id);
+    }
 
+    // === UPDATE OR CREATE IN NOTION ===
     let updated = 0, created = 0;
     for (const [name, phone, id] of rows) {
-      const pageId = map.get(id);
-      const props = {
+      const pageId = idToPageId.get(id);
+
+      const properties = {
         "First Name": { rich_text: [{ text: { content: name } }] },
         "Mobile Phone": phone ? { phone_number: phone } : { phone_number: null },
         "Member ID": { title: [{ text: { content: id } }] }
@@ -71,49 +92,58 @@ async function sync() {
 
       try {
         if (pageId) {
-          await notion.pages.update({ page_id: pageId, properties: props });
+          await notion.pages.update({ page_id: pageId, properties });
           updated++;
         } else {
-          await notion.pages.create({ parent: { database_id: process.env.NOTION_DB }, properties: props });
+          await notion.pages.create({
+            parent: { database_id: process.env.NOTION_DB },
+            properties
+          });
           created++;
         }
-      } catch (e) {
-        console.log(`Notion error for ID ${id}: ${e.message}`);
+      } catch (err) {
+        console.log(`Notion error for ID ${id}:`, err.message);
       }
     }
 
     console.log(`NOTION DONE → Updated: ${updated} | Created: ${created}`);
 
-    // SEND .vcf (ONLY WITH PHONE)
-    const vcfRows = rows.filter(r => r[1]);
-    const vcf = vcfRows.map(([name, phone]) =>
-      `BEGIN:VCARD\nVERSION:3.0\nFN:${name}\nTEL:${phone}\nEND:VCARD`
-    ).join('\n');
+    // === SEND .VCF EMAIL (ONLY WITH PHONE) ===
+    const contactsWithPhone = rows.filter(r => r[1]);
+    if (contactsWithPhone.length > 0) {
+      const vcf = contactsWithPhone.map(([name, phone]) =>
+        `BEGIN:VCARD\nVERSION:3.0\nFN:${name}\nTEL:${phone}\nEND:VCARD`
+      ).join('\n');
 
-    await fetch('https://api.mailgun.net/v3/sandbox91df0697fa28496c9d47efec7d061a34.mailgun.org/messages', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Basic ' + Buffer.from('api:' + process.env.MAILGUN_KEY).toString('base64'),
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
-      body: new URLSearchParams({
-        from: 'Wahaha Sync <mailgun@sandbox91df0697fa28496c9d47efec7d061a34.mailgun.org>',
-        to: 'wahahaseafoodmarketing@gmail.com',
-        subject: `${vcfRows.length} Contacts - Import Now`,
-        text: `Open .vcf on phone → tap → ${vcfRows.length} contacts appear.`,
-        attachment: JSON.stringify({
-          filename: 'wahaha-contacts.vcf',
-          data: Buffer.from(vcf).toString('base64')
+      await fetch('https://api.mailgun.net/v3/sandbox91df0697fa28496c9d47efec7d061a34.mailgun.org/messages', {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Basic ' + Buffer.from('api:' + process.env.MAILGUN_KEY).toString('base64'),
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: new URLSearchParams({
+          from: 'Wahaha Sync <mailgun@sandbox91df0697fa28496c9d47efec7d061a34.mailgun.org>',
+          to: 'wahahaseafoodmarketing@gmail.com',
+          subject: `${contactsWithPhone.length} Contacts - Import Now`,
+          text: `Open .vcf on phone → tap → ${contactsWithPhone.length} contacts appear.`,
+          attachment: JSON.stringify({
+            filename: 'wahaha-contacts.vcf',
+            data: Buffer.from(vcf).toString('base64')
+          })
         })
-      })
-    });
+      });
 
-    console.log('Contacts .vcf emailed');
-  } catch (e) {
-    console.error('FATAL ERROR:', e.message);
+      console.log('.vcf emailed with phones');
+    } else {
+      console.log('No phones found — skipping .vcf email');
+    }
+
+  } catch (error) {
+    console.error('FATAL ERROR:', error.message);
   }
 }
 
+// === ROBUST CSV PARSER (handles quotes, commas inside fields) ===
 function parseCSVLine(line) {
   const result = [];
   let field = '';
@@ -121,25 +151,26 @@ function parseCSVLine(line) {
 
   for (let i = 0; i < line.length; i++) {
     const char = line[i];
-    const nextChar = line[i + 1];
+    const next = line[i + 1];
 
     if (char === '"') {
-      if (inQuote && nextChar === '"') {
+      if (inQuote && next === '"') {
         field += '"';
         i++;
       } else {
         inQuote = !inQuote;
       }
     } else if (char === ',' && !inQuote) {
-      result.push(field.trim());
+      result.push(field);
       field = '';
     } else {
       field += char;
     }
   }
-  result.push(field.trim());
-  return result;
+  result.push(field);
+  return result.map(f => f.trim());
 }
 
+// === RUN NOW + EVERY 24 HOURS ===
 sync();
 setInterval(sync, 24 * 60 * 60 * 1000);
