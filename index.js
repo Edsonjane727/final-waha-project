@@ -5,6 +5,9 @@ const { Client } = require('@notionhq/client');
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
+// === DELAY HELPER ===
+const delay = ms => new Promise(res => setTimeout(res, ms));
+
 async function sync() {
   console.log(`\nSYNC STARTED → ${new Date().toLocaleString('en-GB', { timeZone: 'Asia/Jakarta' })}`);
 
@@ -24,7 +27,7 @@ async function sync() {
       if (!line) continue;
 
       const cols = parseCSVLine(line);
-      if (cols.length < 5) continue; // Need at least ID, First, Last
+      if (cols.length < 5) continue;
 
       const memberId = cols[0]?.trim();
       const firstName = cols[3]?.trim();
@@ -34,16 +37,11 @@ async function sync() {
 
       const fullName = `${firstName} ${lastName}`.trim();
 
-      // SEARCH FOR PHONE IN ANY COLUMN AFTER LAST NAME (index 5+)
       let phone = '';
       for (let j = 5; j < cols.length; j++) {
         let candidate = cols[j]?.trim();
         if (!candidate) continue;
-
-        // Remove all non-digits except +
         candidate = candidate.replace(/[^0-9+]/g, '');
-
-        // Must be 8–15 digits, optionally starting with +
         if (/^\+?\d{8,15}$/.test(candidate)) {
           if (!candidate.startsWith('+')) {
             if (candidate.startsWith('62')) candidate = '+' + candidate;
@@ -60,7 +58,7 @@ async function sync() {
 
     console.log(`Found ${rows.length} members (with phone: ${rows.filter(r => r[1]).length})`);
 
-    // === NOTION: GET ALL EXISTING PAGES ===
+    // === GET EXISTING PAGES ===
     let existing = [];
     let cursor = undefined;
     do {
@@ -71,6 +69,7 @@ async function sync() {
       });
       existing = existing.concat(response.results);
       cursor = response.next_cursor;
+      await delay(350); // Respect rate limit
     } while (cursor);
 
     const idToPageId = new Map();
@@ -79,7 +78,7 @@ async function sync() {
       if (titleText) idToPageId.set(titleText, page.id);
     }
 
-    // === UPDATE OR CREATE IN NOTION ===
+    // === UPDATE/CREATE WITH DELAY ===
     let updated = 0, created = 0;
     for (const [name, phone, id] of rows) {
       const pageId = idToPageId.get(id);
@@ -101,14 +100,16 @@ async function sync() {
           });
           created++;
         }
+        await delay(350); // 3 requests per second = safe
       } catch (err) {
         console.log(`Notion error for ID ${id}:`, err.message);
+        await delay(1000); // Wait longer on error
       }
     }
 
     console.log(`NOTION DONE → Updated: ${updated} | Created: ${created}`);
 
-    // === SEND .VCF EMAIL (ONLY WITH PHONE) ===
+    // === SEND .VCF ===
     const contactsWithPhone = rows.filter(r => r[1]);
     if (contactsWithPhone.length > 0) {
       const vcf = contactsWithPhone.map(([name, phone]) =>
@@ -133,9 +134,7 @@ async function sync() {
         })
       });
 
-      console.log('.vcf emailed with phones');
-    } else {
-      console.log('No phones found — skipping .vcf email');
+      console.log('.vcf emailed');
     }
 
   } catch (error) {
@@ -143,7 +142,6 @@ async function sync() {
   }
 }
 
-// === ROBUST CSV PARSER (handles quotes, commas inside fields) ===
 function parseCSVLine(line) {
   const result = [];
   let field = '';
@@ -171,6 +169,5 @@ function parseCSVLine(line) {
   return result.map(f => f.trim());
 }
 
-// === RUN NOW + EVERY 24 HOURS ===
 sync();
 setInterval(sync, 24 * 60 * 60 * 1000);
